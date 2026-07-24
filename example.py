@@ -1,5 +1,14 @@
+import sys
+
 import torch
 from open_mythos.main import OpenMythos, MythosConfig
+
+# Windows consoles default to a legacy codepage (cp1252) that can't encode
+# characters like the ρ printed below; force UTF-8 so output works everywhere.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except (AttributeError, ValueError):
+    pass
 
 
 attn_type = "mla"  # or "gqa"
