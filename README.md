@@ -31,6 +31,12 @@
       <img alt="YouTube" src="https://img.shields.io/badge/YouTube-Watch-FF0000?style=for-the-badge&logo=youtube&logoColor=white">
     </picture>
   </a>
+  <a href="https://www.instagram.com/reel/DXbqCdaDK43/" target="_blank">
+    <picture>
+      <source srcset="https://img.shields.io/badge/Instagram-Watch-E4405F?style=for-the-badge&logo=instagram&logoColor=white" media="(prefers-color-scheme: dark)">
+      <img alt="Instagram" src="https://img.shields.io/badge/Instagram-Watch-E4405F?style=for-the-badge&logo=instagram&logoColor=white">
+    </picture>
+  </a>
 </p>
 
 > **Disclaimer:** OpenMythos is an independent, community-driven theoretical reconstruction based solely on publicly available research and speculation. It is not affiliated with, endorsed by, or connected to Anthropic or any of their proprietary systems.
@@ -401,6 +407,7 @@ Theoretical analysis suggests 2-3x improvements in inference throughput. For a d
 ### Video
 
 - OpenMythos walkthrough: https://youtu.be/elzKMeRJrJs
+- OpenMythos reel: https://www.instagram.com/reel/DXbqCdaDK43/
 
 ### Twitter / X
 
