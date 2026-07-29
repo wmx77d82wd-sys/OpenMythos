@@ -15,6 +15,7 @@ from open_mythos.main import (
     loop_index_embedding,
     precompute_rope_freqs,
 )
+from open_mythos.moda import MoDAConfig, MoDAModel
 from open_mythos.tokenizer import MythosTokenizer
 from open_mythos.variants import (
     mythos_1b,
@@ -49,7 +50,7 @@ __all__ = [
     "mythos_100b",
     "mythos_500b",
     "mythos_1t",
-    "load_tokenizer",
-    "get_vocab_size",
     "MythosTokenizer",
+    "MoDAConfig",
+    "MoDAModel",
 ]
