@@ -2,11 +2,16 @@
 """
 OpenMythos pretraining on FineWeb-Edu with FSDP + AdamW.
 
+Trains the 1B variant with the recurrent depth *sampled* per step rather than
+pinned to cfg.max_loop_iters — training at a single fixed depth is what stops a
+looped model from extrapolating to deeper inference-time loops, which is the
+whole property this architecture exists to demonstrate.
+
 Single GPU:
-    python training/3b_fine_web_edu.py
+    python training/pretrain_fine_web_edu.py
 
 Multi-GPU:
-    torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
+    torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/pretrain_fine_web_edu.py
 """
 
 import os
@@ -30,8 +35,13 @@ from contextlib import nullcontext
 from datasets import load_dataset
 
 from open_mythos import OpenMythos
-from open_mythos.main import TransformerBlock, RecurrentBlock
-from open_mythos.variants import mythos_3b
+from open_mythos.main import (
+    TransformerBlock,
+    RecurrentBlock,
+    sample_n_loops,
+    update_router_bias,
+)
+from open_mythos.variants import mythos_1b
 from open_mythos.tokenizer import MythosTokenizer
 
 
@@ -322,13 +332,14 @@ def main():
     Lifecycle:
         1. Initialize torch.distributed (NCCL) if launched under torchrun.
         2. Build tokenizer → derive vocab_size.
-        3. Construct OpenMythos with the 3B variant config.
+        3. Construct OpenMythos with the 1B variant config.
         4. Wrap in FSDP with FULL_SHARD + bf16/fp16 mixed precision (multi-GPU)
            or move to device + autocast (single-GPU).
         5. Build fused AdamW on (possibly sharded) parameters.
         6. Resume from the latest checkpoint in `ckpt_dir` if one exists.
         7. Stream FineWeb-Edu through grad-accumulation microbatches with
-           cosine LR schedule, per-step logging, and periodic checkpoints.
+           cosine LR schedule, a per-step sampled recurrent depth, an
+           aux-loss-free MoE bias update, logging, and periodic checkpoints.
         8. Write a final checkpoint if the last save wasn't aligned to
            `ckpt_every`, then barrier + tear down the process group.
 
@@ -383,7 +394,15 @@ def main():
     log_every = 10
     ckpt_every = 1000
     ckpt_dir = "checkpoints"
-    dataset_subset = "sample-10BT"  # → sample-100BT or "default" for full run
+    # Must hold at least target_tokens. sample-10BT would silently give ~3
+    # epochs of the same 10B tokens, since the loader restarts its stream on
+    # exhaustion — repetition the dataset docstring assumes does not happen.
+    dataset_subset = "sample-100BT"
+    # Aux-loss-free MoE balancing step size (DeepSeek-V3).
+    router_bias_gamma = 1e-3
+    # Run-level seed for the recurrent-depth schedule. Every rank derives the
+    # same per-step depth from it, so it must not vary across ranks.
+    loop_seed = 1234
 
     if master:
         logger.info(
@@ -394,7 +413,7 @@ def main():
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    cfg = mythos_3b()
+    cfg = mythos_1b()
     cfg.vocab_size = vocab_size
     cfg.max_seq_len = seq_len
 
@@ -404,10 +423,15 @@ def main():
     model = OpenMythos(cfg)
 
     if ddp:
+        # buffer_dtype stays fp32. Casting buffers to bf16 would corrupt two
+        # things: freqs_cis is complex64 (a real-valued bf16 copy cannot hold a
+        # phasor, and apply_rope's complex multiply would fail against it), and
+        # MoEFFN.expert_load counts tokens, which bf16 represents exactly only
+        # up to 256.
         mp_policy = MixedPrecision(
             param_dtype=amp_dtype,
             reduce_dtype=amp_dtype,
-            buffer_dtype=amp_dtype,
+            buffer_dtype=torch.float32,
         )
         wrap_policy = ModuleWrapPolicy({TransformerBlock, RecurrentBlock})
         model = FSDP(
@@ -480,6 +504,11 @@ def main():
         optimizer.zero_grad()
         loss_accum = 0.0
 
+        # One depth for the whole step, drawn identically on every rank. Varying
+        # it per microbatch would desynchronize the FSDP collectives inside the
+        # recurrent block.
+        n_loops = sample_n_loops(step, cfg.max_loop_iters, seed=loop_seed)
+
         for micro_step in range(grad_accum):
             try:
                 x, y = next(data_iter)
@@ -496,7 +525,7 @@ def main():
                 else model.no_sync()
             )
             with sync, amp_ctx:
-                logits = model(x)
+                logits = model(x, n_loops=n_loops)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, vocab_size), y.view(-1)
                 )
@@ -513,15 +542,24 @@ def main():
         else:
             grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+
+        # After the weight update, so the tallies reflect the routing that this
+        # step's gradients were actually computed from. Also clears the tallies,
+        # making the balance signal per-step rather than cumulative.
+        update_router_bias(model, gamma=router_bias_gamma)
+
         step += 1
 
         if master and step % log_every == 0:
             dt = time.perf_counter() - t0
             tok_per_sec = global_batch_tok * log_every / dt
             tokens_seen = step * global_batch_tok
+            # n_loops is logged because it varies per step: throughput is now
+            # depth-dependent, so tok/s is only interpretable alongside it.
             logger.info(
                 f"step {step:6d}/{total_steps} | loss {loss_accum:.4f} "
                 f"| gnorm {float(grad_norm):.2f} | lr {cur_lr:.2e} "
+                f"| loops {n_loops:2d} "
                 f"| {tok_per_sec / 1e6:.2f}M tok/s "
                 f"| {tokens_seen / 1e9:.1f}B tokens seen"
             )

@@ -14,6 +14,8 @@ from open_mythos.main import (
     apply_rope,
     loop_index_embedding,
     precompute_rope_freqs,
+    sample_n_loops,
+    update_router_bias,
 )
 from open_mythos.moda import MoDAConfig, MoDAModel
 from open_mythos.tokenizer import MythosTokenizer
@@ -43,6 +45,8 @@ __all__ = [
     "precompute_rope_freqs",
     "apply_rope",
     "loop_index_embedding",
+    "sample_n_loops",
+    "update_router_bias",
     "mythos_1b",
     "mythos_3b",
     "mythos_10b",

@@ -1,7 +1,9 @@
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -481,8 +483,16 @@ class MoEFFN(nn.Module):
         self.topk = cfg.n_experts_per_tok
 
         self.router = nn.Linear(cfg.dim, cfg.n_experts, bias=False)
-        # load-balancing bias adjusted externally during training; not a gradient param
+        # load-balancing bias driven by update_router_bias(); not a gradient param.
+        # Persistent so a resumed run keeps the balance state it had learned.
         self.register_buffer("router_bias", torch.zeros(cfg.n_experts))
+        # Routed-token tally since the last update_router_bias() call. Non-persistent:
+        # it is per-interval scratch, meaningless once reloaded. Must stay fp32 —
+        # bf16 counts integers exactly only up to 256, and a single step routes
+        # far more tokens than that per expert.
+        self.register_buffer(
+            "expert_load", torch.zeros(cfg.n_experts), persistent=False
+        )
 
         self.routed_experts = nn.ModuleList(
             [Expert(cfg.dim, cfg.expert_dim) for _ in range(cfg.n_experts)]
@@ -515,6 +525,15 @@ class MoEFFN(nn.Module):
         topk_scores = scores.gather(-1, topk_idx)
         topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # renorm
 
+        # Tally which experts fired so update_router_bias() can correct the bias.
+        # Without this the bias stays at its initial zeros and the aux-loss-free
+        # balancing scheme is inert, letting a few experts win all the routing.
+        if self.training:
+            with torch.no_grad():
+                self.expert_load += torch.bincount(
+                    topk_idx.flatten(), minlength=self.n_experts
+                ).to(self.expert_load.dtype)
+
         # routed expert dispatch (token-level scatter)
         out = torch.zeros_like(flat)
         for i in range(self.topk):
@@ -531,6 +550,60 @@ class MoEFFN(nn.Module):
             out = out + shared(flat)
 
         return out.view(B, T, D)
+
+
+@torch.no_grad()
+def update_router_bias(model: nn.Module, gamma: float = 1e-3) -> int:
+    """
+    Nudge every MoEFFN router bias toward balanced expert load (DeepSeek-V3).
+
+    Aux-loss-free balancing works by biasing only *selection*: an underused
+    expert gets its bias raised so top-K picks it more often, while the gating
+    weights keep coming from the unbiased softmax so the loss is never
+    distorted. That only works if something actually drives the bias — call
+    this once per optimizer step, after `optimizer.step()`.
+
+    The update is by sign, not magnitude, so a single pathological interval
+    cannot blow the bias out: b_i += gamma if expert i was underloaded,
+    b_i -= gamma if overloaded.
+
+    Under a distributed job every rank routes different tokens, so the tallies
+    are summed across ranks before the comparison — balancing against one
+    rank's local view would fight the other ranks. Every rank then applies the
+    identical update to its replicated copy of the bias, so the buffers stay in
+    sync without a broadcast.
+
+    Args:
+        model -- any module tree containing MoEFFN layers (FSDP-wrapped is fine;
+                 the inner modules stay reachable and buffers are replicated,
+                 not sharded)
+        gamma -- per-step bias step size; DeepSeek-V3 uses 1e-3
+
+    Returns:
+        Number of MoEFFN layers updated. Zero means the model has no MoE
+        layers, or `.train()` was never set, and balancing is silently inert.
+    """
+    updated = 0
+    use_dist = dist.is_available() and dist.is_initialized()
+
+    for m in model.modules():
+        if not isinstance(m, MoEFFN):
+            continue
+
+        load = m.expert_load
+        if use_dist:
+            dist.all_reduce(load, op=dist.ReduceOp.SUM)
+
+        total = load.sum()
+        if total > 0:
+            # Positive error = expert saw fewer tokens than its fair share.
+            err = total / m.n_experts - load
+            m.router_bias += gamma * torch.sign(err)
+            updated += 1
+
+        load.zero_()
+
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +646,66 @@ def loop_index_embedding(
 # ---------------------------------------------------------------------------
 # Depth-wise LoRA adapter (per loop iteration)
 # ---------------------------------------------------------------------------
+
+
+def sample_n_loops(
+    step: int,
+    max_loops: int,
+    sigma: float = 0.5,
+    seed: int = 1234,
+    mean_scale: float = 0.5,
+) -> int:
+    """
+    Sample a recurrent depth for one training step (log-normal Poisson).
+
+    Training at a fixed depth is the reason a looped model fails to extrapolate:
+    if every step runs exactly `max_loop_iters` iterations, the hidden-state
+    update is never asked to stay coherent at any other depth, and running
+    deeper at inference walks off the manifold the model was fit on. Sampling
+    the depth per step instead spreads supervision over a range, which is what
+    makes depth extrapolation emerge (Geiping et al., 2025).
+
+    The distribution is heavy-tailed on purpose — a Poisson whose rate is itself
+    log-normal. Most steps land near `max_loops * mean_scale`, cheap enough that
+    throughput stays reasonable, while a thin tail reaches `max_loops` so the
+    deep end is still trained. Values are clamped into [1, max_loops], so the
+    tail mass piles up at exactly `max_loops` rather than being discarded.
+
+    Determinism matters twice over. Under FSDP the recurrent block issues one
+    all-gather per iteration, so ranks that disagree on the depth would issue
+    different numbers of collectives and the job would hang — every rank must
+    get the same answer. Seeding a private CPU generator from `seed + step`
+    guarantees that without any communication, and also makes a resumed run
+    replay the exact depth schedule it would have had.
+
+    Args:
+        step       -- global optimizer step; the only thing that varies the draw
+        max_loops  -- inclusive upper bound, normally cfg.max_loop_iters
+        sigma      -- log-normal spread of the Poisson rate; larger = more varied
+        seed       -- run-level seed folded together with `step`
+        mean_scale -- fraction of `max_loops` the rate centers on
+
+    Returns:
+        Recurrent depth in [1, max_loops], identical on every rank for a
+        given (step, seed).
+    """
+    if max_loops < 1:
+        raise ValueError(f"max_loops must be >= 1, got {max_loops}")
+    if max_loops == 1:
+        return 1
+
+    gen = torch.Generator()  # CPU: device-independent, so all ranks agree
+    gen.manual_seed(seed + step)
+
+    mean_rate = max(1.0, max_loops * mean_scale)
+    # Solve mu so that E[LogNormal(mu, sigma)] == mean_rate.
+    mu = math.log(mean_rate) - 0.5 * sigma * sigma
+    rate = math.exp(torch.normal(mu, sigma, (1,), generator=gen).item())
+
+    # +1 so a zero draw still runs one iteration; a depth-0 loop would hand the
+    # coda an all-zero hidden state.
+    n = int(torch.poisson(torch.tensor([rate]), generator=gen).item()) + 1
+    return max(1, min(n, max_loops))
 
 
 class LoRAAdapter(nn.Module):

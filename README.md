@@ -154,29 +154,34 @@ print(f"Parameters: {total:,}")
 
 ## Training
 
-The training script for the 3B model on FineWeb-Edu is at [`training/3b_fine_web_edu.py`](training/3b_fine_web_edu.py).
+The pretraining script for the 1B model on FineWeb-Edu is at [`training/pretrain_fine_web_edu.py`](training/pretrain_fine_web_edu.py).
 
 **Single GPU:**
 ```bash
-python training/3b_fine_web_edu.py
+python training/pretrain_fine_web_edu.py
 ```
 
 **Multi-GPU (auto-detects GPU count):**
 ```bash
-torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/3b_fine_web_edu.py
+torchrun --nproc_per_node=$(python -c "import torch; print(torch.cuda.device_count())") training/pretrain_fine_web_edu.py
 ```
 
 Key design choices:
 
 | Feature | Detail |
 |---|---|
-| Optimizer | AdamW |
-| Dataset | `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default, swap to `sample-100BT` or `default` for full run) |
+| Optimizer | AdamW (fused), grad-norm clip 1.0 |
+| Dataset | `HuggingFaceFW/fineweb-edu` (`sample-100BT`; must hold at least the token target, or the stream restarts and silently re-trains on the same tokens) |
 | Tokenizer | `openai/gpt-oss-20b` via `MythosTokenizer` |
-| Parallelism | PyTorch DDP via `torchrun`, sharded streaming dataset |
-| Precision | bfloat16 on H100/A100, float16 + GradScaler on older GPUs |
+| Parallelism | FSDP `FULL_SHARD` via `torchrun`, sharded streaming dataset |
+| Precision | bfloat16 params/grads on H100/A100, float16 elsewhere; buffers stay fp32 (RoPE phasors are complex64) |
 | Schedule | Linear warmup (2000 steps) → cosine decay |
+| Recurrent depth | Sampled per step (log-normal Poisson, clamped to `[1, max_loop_iters]`) — a fixed depth trains away depth extrapolation |
+| MoE balancing | Aux-loss-free router-bias update (DeepSeek-V3), γ=1e-3, load summed across ranks |
 | Target | 30B tokens (~Chinchilla-adjusted for looped architecture) |
+
+> `float16` is passed straight to `autocast` without a `GradScaler`, so the fp16
+> path is untested and prone to underflow. Use a bf16-capable GPU.
 
 ---
 
