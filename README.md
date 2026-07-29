@@ -25,6 +25,12 @@
       <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-Implemented-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white">
     </picture>
   </a>
+  <a href="https://youtu.be/elzKMeRJrJs" target="_blank">
+    <picture>
+      <source srcset="https://img.shields.io/badge/YouTube-Watch-FF0000?style=for-the-badge&logo=youtube&logoColor=white" media="(prefers-color-scheme: dark)">
+      <img alt="YouTube" src="https://img.shields.io/badge/YouTube-Watch-FF0000?style=for-the-badge&logo=youtube&logoColor=white">
+    </picture>
+  </a>
 </p>
 
 > **Disclaimer:** OpenMythos is an independent, community-driven theoretical reconstruction based solely on publicly available research and speculation. It is not affiliated with, endorsed by, or connected to Anthropic or any of their proprietary systems.
@@ -391,6 +397,10 @@ Theoretical analysis suggests 2-3x improvements in inference throughput. For a d
 ---
 
 ## References
+
+### Video
+
+- OpenMythos walkthrough: https://youtu.be/elzKMeRJrJs
 
 ### Twitter / X
 
