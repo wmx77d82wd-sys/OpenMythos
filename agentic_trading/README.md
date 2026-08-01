@@ -44,6 +44,12 @@ agentic-trading
 
 ### Connect Claude Code
 
+This repo ships a project-scoped config (`.mcp.json` at the repository
+root), so opening the repo in Claude Code registers the server
+automatically — approve it when prompted and check with `/mcp`.
+
+To register it manually in another project:
+
 ```bash
 # after `pip install -e agentic_trading/` the console script works anywhere:
 claude mcp add agentic-trading -- agentic-trading

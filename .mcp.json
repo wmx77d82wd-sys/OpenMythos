@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agentic-trading": {
+      "command": "python3",
+      "args": ["-m", "trading_mcp"],
+      "env": {
+        "PYTHONPATH": "agentic_trading"
+      }
+    }
+  }
+}
