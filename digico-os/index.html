@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DigiCo Quantum OS</title>
+<style>
+  :root { --bg1:#0b1026; --bg2:#3b1d6e; --panel:#141a33ee; --fg:#e8ecff; --accent:#7c5cff; --border:#2a3360; }
+  :root[data-theme="light"] { --bg1:#dfe7ff; --bg2:#f3e8ff; --panel:#ffffffee; --fg:#14182e; --accent:#5b3df5; --border:#c5cdf0; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; overflow:hidden; font:14px system-ui,sans-serif; color:var(--fg); }
+  #desktop { position:fixed; inset:0 0 44px 0; background:radial-gradient(circle at 20% 20%, var(--bg2), var(--bg1)); }
+  #icons { position:absolute; top:12px; left:12px; display:grid; gap:10px; grid-template-columns:repeat(auto-fill,84px); width:60%; }
+  .icon { width:84px; text-align:center; padding:8px 4px; border-radius:10px; cursor:pointer; user-select:none; }
+  .icon:hover { background:#ffffff22; }
+  .icon .ico { font-size:32px; }
+  .icon .lbl { font-size:12px; margin-top:4px; word-break:break-word; }
+  .win { position:absolute; background:var(--panel); border:1px solid var(--border); border-radius:10px; box-shadow:0 10px 40px #0008; display:flex; flex-direction:column; min-width:260px; min-height:160px; resize:both; overflow:hidden; backdrop-filter:blur(8px); }
+  .win .bar { display:flex; align-items:center; gap:8px; padding:6px 10px; background:#ffffff14; cursor:move; user-select:none; }
+  .win .bar .t { flex:1; font-weight:600; }
+  .win .bar button { background:none; border:0; color:var(--fg); cursor:pointer; font-size:15px; border-radius:4px; padding:2px 7px; }
+  .win .bar button:hover { background:#ffffff2a; }
+  .win .body { flex:1; overflow:auto; padding:10px; }
+  .win iframe { width:100%; height:100%; border:0; background:#fff; border-radius:6px; }
+  .win.focus { border-color:var(--accent); }
+  #taskbar { position:fixed; left:0; right:0; bottom:0; height:44px; background:var(--panel); border-top:1px solid var(--border); display:flex; align-items:center; gap:6px; padding:0 8px; backdrop-filter:blur(8px); z-index:99999; }
+  #taskbar button, .btn { background:#ffffff1a; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:6px 12px; cursor:pointer; font:inherit; }
+  #taskbar button:hover, .btn:hover { background:#ffffff33; }
+  .btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #tasks { flex:1; display:flex; gap:6px; overflow:hidden; }
+  #clock { padding:0 8px; opacity:.85; }
+  #menu { position:fixed; bottom:48px; left:8px; width:260px; max-height:70vh; overflow:auto; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:8px; display:none; z-index:99998; }
+  #menu .item { padding:8px 10px; border-radius:8px; cursor:pointer; display:flex; gap:10px; align-items:center; }
+  #menu .item:hover { background:#ffffff22; }
+  input, textarea, select { width:100%; background:#00000033; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:8px; font:inherit; }
+  textarea { font-family:ui-monospace,monospace; resize:vertical; }
+  label { display:block; margin:8px 0 4px; opacity:.85; }
+  .term { font-family:ui-monospace,monospace; background:#000a; color:#9dff9d; height:100%; overflow:auto; padding:8px; border-radius:6px; white-space:pre-wrap; }
+  .term input { background:none; border:0; color:inherit; padding:0; width:70%; outline:none; font:inherit; }
+</style>
+</head>
+<body>
+<div id="desktop"><div id="icons"></div></div>
+<div id="menu"></div>
+<div id="taskbar">
+  <button id="startBtn">⚛️ Inicio</button>
+  <div id="tasks"></div>
+  <span id="clock"></span>
+</div>
+
+<script>
+// ---------- Estado persistente ----------
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem('dqos.' + k); return v ? JSON.parse(v) : d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('dqos.' + k, JSON.stringify(v)); } catch {} }
+};
+let customApps = LS.get('apps', []);   // {id,name,icon,type:'html'|'url',content}
+let settings   = LS.get('settings', { theme: 'dark', bg1: '#0b1026', bg2: '#3b1d6e' });
+let notes      = LS.get('notes', '');
+
+function applySettings() {
+  const r = document.documentElement;
+  r.dataset.theme = settings.theme;
+  if (settings.theme === 'dark') { r.style.setProperty('--bg1', settings.bg1); r.style.setProperty('--bg2', settings.bg2); }
+  else { r.style.removeProperty('--bg1'); r.style.removeProperty('--bg2'); }
+}
+const saveApps = () => LS.set('apps', customApps);
+const saveSettings = () => { LS.set('settings', settings); applySettings(); };
+
+// ---------- Gestor de ventanas ----------
+let z = 10, winCount = 0;
+const wins = new Map();
+
+function openWindow(title, icon, render, opts = {}) {
+  const id = ++winCount;
+  const el = document.createElement('div');
+  el.className = 'win';
+  const off = (id % 8) * 28;
+  Object.assign(el.style, { left: (80 + off) + 'px', top: (50 + off) + 'px', width: (opts.w || 520) + 'px', height: (opts.h || 380) + 'px' });
+  el.innerHTML = `<div class="bar"><span>${icon}</span><span class="t"></span><button data-a="min">–</button><button data-a="max">▢</button><button data-a="close">✕</button></div><div class="body"></div>`;
+  el.querySelector('.t').textContent = title;
+  const body = el.querySelector('.body');
+  document.getElementById('desktop').appendChild(el);
+
+  const task = document.createElement('button');
+  task.textContent = icon + ' ' + title;
+  document.getElementById('tasks').appendChild(task);
+
+  const w = { el, task, min: false, prev: null };
+  wins.set(id, w);
+  const focus = () => { el.style.zIndex = ++z; wins.forEach(o => o.el.classList.remove('focus')); el.classList.add('focus'); };
+  const toggleMin = () => { w.min = !w.min; el.style.display = w.min ? 'none' : 'flex'; if (!w.min) focus(); };
+  const close = () => { el.remove(); task.remove(); wins.delete(id); };
+
+  el.addEventListener('mousedown', focus);
+  task.onclick = () => (w.min || !el.classList.contains('focus')) ? (w.min && toggleMin(), focus()) : toggleMin();
+  el.querySelector('[data-a=close]').onclick = close;
+  el.querySelector('[data-a=min]').onclick = toggleMin;
+  el.querySelector('[data-a=max]').onclick = () => {
+    if (w.prev) { Object.assign(el.style, w.prev); w.prev = null; }
+    else { w.prev = { left: el.style.left, top: el.style.top, width: el.style.width, height: el.style.height }; Object.assign(el.style, { left: 0, top: 0, width: '100%', height: '100%' }); }
+  };
+
+  // arrastrar
+  const bar = el.querySelector('.bar');
+  bar.addEventListener('mousedown', e => {
+    if (e.target.tagName === 'BUTTON') return;
+    const sx = e.clientX - el.offsetLeft, sy = e.clientY - el.offsetTop;
+    const mv = ev => { el.style.left = (ev.clientX - sx) + 'px'; el.style.top = Math.max(0, ev.clientY - sy) + 'px'; };
+    const up = () => { removeEventListener('mousemove', mv); removeEventListener('mouseup', up); };
+    addEventListener('mousemove', mv); addEventListener('mouseup', up);
+  });
+
+  render(body, { close });
+  focus();
+  return w;
+}
+
+// ---------- Apps integradas ----------
+const builtins = [
+  { id: 'terminal', name: 'Terminal', icon: '⌨️', open: openTerminal },
+  { id: 'notes',    name: 'Notas',    icon: '📝', open: openNotes },
+  { id: 'builder',  name: 'Agregar App', icon: '➕', open: openBuilder },
+  { id: 'manager',  name: 'Mis Apps', icon: '🗂️', open: openManager },
+  { id: 'settings', name: 'Ajustes',  icon: '⚙️', open: openSettings },
+];
+
+function openNotes() {
+  openWindow('Notas', '📝', b => {
+    b.style.padding = '0';
+    b.innerHTML = '<textarea style="height:100%;border:0;border-radius:0" placeholder="Escribe aquí…"></textarea>';
+    const t = b.firstChild; t.value = notes;
+    t.oninput = () => { notes = t.value; LS.set('notes', notes); };
+  });
+}
+
+function openCustom(app) {
+  openWindow(app.name, app.icon, b => {
+    b.style.padding = '0';
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+    if (app.type === 'url') f.src = app.content; else f.srcdoc = app.content;
+    b.appendChild(f);
+  }, { w: 640, h: 440 });
+}
+
+function openBuilder(editId) {
+  const editing = typeof editId === 'string' ? customApps.find(a => a.id === editId) : null;
+  openWindow(editing ? 'Editar App' : 'Agregar App', '➕', (b, { close }) => {
+    b.innerHTML = `
+      <label>Nombre</label><input id="n" placeholder="Mi app">
+      <label>Ícono (emoji)</label><input id="i" value="🧩" maxlength="4">
+      <label>Tipo</label><select id="t"><option value="html">Código HTML/JS (lo escribes aquí)</option><option value="url">URL externa</option></select>
+      <label>Contenido (código o URL)</label><textarea id="c" rows="10" placeholder="<h1>Hola</h1>&lt;script&gt;…&lt;/script&gt;"></textarea>
+      <p><button class="btn primary" id="ok">${editing ? 'Guardar' : 'Instalar'}</button></p>`;
+    if (editing) { n.value = editing.name; i.value = editing.icon; t.value = editing.type; c.value = editing.content; }
+    ok.onclick = () => {
+      if (!n.value.trim() || !c.value.trim()) return alert('Falta nombre o contenido');
+      const data = { name: n.value.trim(), icon: i.value || '🧩', type: t.value, content: c.value };
+      if (editing) Object.assign(editing, data); else customApps.push({ id: 'app' + Date.now(), ...data });
+      saveApps(); refresh(); close();
+    };
+  }, { w: 480, h: 520 });
+}
+
+function openManager() {
+  openWindow('Mis Apps', '🗂️', b => {
+    const draw = () => {
+      b.innerHTML = customApps.length ? '' : '<p>No has instalado apps todavía. Usa ➕ Agregar App.</p>';
+      customApps.forEach(a => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px';
+        row.innerHTML = `<span style="flex:1">${a.icon} <b></b></span><button class="btn" data-e>Editar</button><button class="btn" data-d>Borrar</button>`;
+        row.querySelector('b').textContent = a.name;
+        row.querySelector('[data-e]').onclick = () => openBuilder(a.id);
+        row.querySelector('[data-d]').onclick = () => { customApps = customApps.filter(x => x !== a); saveApps(); refresh(); draw(); };
+        b.appendChild(row);
+      });
+    };
+    draw();
+  });
+}
+
+function openSettings() {
+  openWindow('Ajustes', '⚙️', b => {
+    b.innerHTML = `
+      <label>Tema</label><select id="th"><option value="dark">Oscuro</option><option value="light">Claro</option></select>
+      <label>Fondo (color 1)</label><input id="c1" type="color">
+      <label>Fondo (color 2)</label><input id="c2" type="color">
+      <p><button class="btn" id="exp">Exportar todo (JSON)</button> <button class="btn" id="imp">Importar</button> <button class="btn" id="rst">Restablecer</button></p>`;
+    th.value = settings.theme; c1.value = settings.bg1; c2.value = settings.bg2;
+    th.onchange = () => { settings.theme = th.value; saveSettings(); };
+    c1.oninput = () => { settings.bg1 = c1.value; saveSettings(); };
+    c2.oninput = () => { settings.bg2 = c2.value; saveSettings(); };
+    exp.onclick = () => {
+      const blob = new Blob([JSON.stringify({ apps: customApps, settings, notes }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'digico-os-backup.json'; a.click();
+    };
+    imp.onclick = () => {
+      const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'application/json';
+      inp.onchange = async () => {
+        try {
+          const d = JSON.parse(await inp.files[0].text());
+          customApps = d.apps || []; settings = d.settings || settings; notes = d.notes || '';
+          saveApps(); saveSettings(); LS.set('notes', notes); refresh();
+        } catch { alert('Archivo inválido'); }
+      };
+      inp.click();
+    };
+    rst.onclick = () => { if (confirm('¿Borrar todo?')) { Object.keys(localStorage).filter(k => k.startsWith('dqos.')).forEach(k => localStorage.removeItem(k)); location.reload(); } };
+  }, { w: 420, h: 400 });
+}
+
+function openTerminal() {
+  openWindow('Terminal', '⌨️', b => {
+    b.style.padding = '0';
+    b.innerHTML = '<div class="term"><div id="out">DigiCo Quantum OS — escribe "help"\n</div>$ <input id="in" autofocus></div>';
+    const term = b.firstChild, out = b.querySelector('#out'), inp = b.querySelector('#in');
+    const print = s => { out.textContent += s + '\n'; term.scrollTop = term.scrollHeight; };
+    const all = () => [...builtins, ...customApps];
+    const find = n => all().find(a => a.id === n || a.name.toLowerCase() === n.toLowerCase());
+    const cmds = {
+      help: () => print('help | apps | open <app> | install <nombre> <url> | remove <app> | theme dark|light | date | clear | echo <txt>'),
+      apps: () => print(all().map(a => a.icon + ' ' + a.name).join('\n')),
+      open: a => { const x = find(a.join(' ')); x ? (x.open ? x.open() : openCustom(x)) : print('No existe: ' + a.join(' ')); },
+      install: a => { if (a.length < 2) return print('uso: install <nombre> <url>'); customApps.push({ id: 'app' + Date.now(), name: a[0], icon: '🌐', type: 'url', content: a[1] }); saveApps(); refresh(); print('Instalada ' + a[0]); },
+      remove: a => { const n = customApps.length; customApps = customApps.filter(x => x.name.toLowerCase() !== a.join(' ').toLowerCase()); saveApps(); refresh(); print(n === customApps.length ? 'No encontrada' : 'Eliminada'); },
+      theme: a => { settings.theme = a[0] === 'light' ? 'light' : 'dark'; saveSettings(); },
+      date: () => print(new Date().toString()),
+      clear: () => { out.textContent = ''; },
+      echo: a => print(a.join(' ')),
+    };
+    inp.onkeydown = e => {
+      if (e.key !== 'Enter') return;
+      const line = inp.value.trim(); inp.value = ''; print('$ ' + line);
+      if (!line) return;
+      const [c, ...a] = line.split(/\s+/);
+      (cmds[c] || (() => print('Comando desconocido: ' + c)))(a);
+    };
+    term.onclick = () => inp.focus();
+  });
+}
+
+// ---------- Escritorio y menú ----------
+function refresh() {
+  const icons = document.getElementById('icons'), menu = document.getElementById('menu');
+  icons.innerHTML = ''; menu.innerHTML = '';
+  [...builtins, ...customApps].forEach(a => {
+    const launch = () => { menu.style.display = 'none'; a.open ? a.open() : openCustom(a); };
+    const ic = document.createElement('div'); ic.className = 'icon';
+    ic.innerHTML = `<div class="ico">${a.icon}</div><div class="lbl"></div>`; ic.querySelector('.lbl').textContent = a.name;
+    ic.ondblclick = launch; ic.onclick = e => { if (matchMedia('(pointer:coarse)').matches) launch(); };
+    icons.appendChild(ic);
+    const it = document.createElement('div'); it.className = 'item'; it.textContent = a.icon + '  ' + a.name; it.onclick = launch;
+    menu.appendChild(it);
+  });
+}
+document.getElementById('startBtn').onclick = e => { e.stopPropagation(); const m = document.getElementById('menu'); m.style.display = m.style.display === 'block' ? 'none' : 'block'; };
+document.addEventListener('click', e => { if (!e.target.closest('#menu')) document.getElementById('menu').style.display = 'none'; });
+setInterval(() => document.getElementById('clock').textContent = new Date().toLocaleTimeString(), 1000);
+
+applySettings(); refresh();
+</script>
+</body>
+</html>
