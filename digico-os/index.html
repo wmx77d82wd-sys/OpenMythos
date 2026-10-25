@@ -37,10 +37,21 @@
   label { display:block; margin:8px 0 4px; opacity:.85; }
   .term { font-family:ui-monospace,monospace; background:#000a; color:#9dff9d; height:100%; overflow:auto; padding:8px; border-radius:6px; white-space:pre-wrap; }
   .term input { background:none; border:0; color:inherit; padding:0; width:70%; outline:none; font:inherit; }
+  #qbg { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #icons { z-index:1; }
+  #toasts { position:fixed; right:12px; bottom:56px; display:flex; flex-direction:column; gap:8px; z-index:100000; }
+  .toast { background:var(--panel); border:1px solid var(--accent); border-radius:10px; padding:10px 14px; max-width:300px; animation:in .2s; }
+  @keyframes in { from { transform:translateY(10px); opacity:0; } }
+  .row { display:flex; gap:8px; align-items:center; padding:5px 6px; border-radius:6px; cursor:pointer; }
+  .row:hover { background:#ffffff1a; }
+  .bar2 { height:14px; background:var(--accent); border-radius:4px; transition:width .25s; min-width:1px; }
+  .gates { display:flex; flex-wrap:wrap; gap:4px; margin:4px 0 8px; align-items:center; }
+  .gates .btn { padding:4px 10px; }
 </style>
 </head>
 <body>
-<div id="desktop"><div id="icons"></div></div>
+<div id="desktop"><canvas id="qbg"></canvas><div id="icons"></div></div>
+<div id="toasts"></div>
 <div id="menu"></div>
 <div id="taskbar">
   <button id="startBtn">⚛️ Inicio</button>
@@ -55,8 +66,29 @@ const LS = {
   set(k, v) { try { localStorage.setItem('dqos.' + k, JSON.stringify(v)); } catch {} }
 };
 let customApps = LS.get('apps', []);   // {id,name,icon,type:'html'|'url',content}
-let settings   = LS.get('settings', { theme: 'dark', bg1: '#0b1026', bg2: '#3b1d6e' });
+let settings   = Object.assign({ theme: 'dark', bg1: '#0b1026', bg2: '#3b1d6e', qbg: true }, LS.get('settings', {}));
 let notes      = LS.get('notes', '');
+
+// Sistema de archivos virtual: mapa plano ruta -> contenido (las carpetas son prefijos)
+let fs = LS.get('fs', { '/Bienvenida.txt': 'Bienvenido a DigiCo Quantum OS.\nAquí guardas tus archivos. Tus apps usan os.fs dentro de /apps/<id>/.' });
+const saveFs = () => LS.set('fs', fs);
+const absPath = p => p.startsWith('/') ? p : '/' + p;
+function fsEntries(dir) {
+  const seen = new Map();
+  for (const k of Object.keys(fs)) {
+    if (!k.startsWith(dir)) continue;
+    const rest = k.slice(dir.length), i = rest.indexOf('/');
+    if (i >= 0) seen.set(rest.slice(0, i), true);
+    else if (rest !== '.keep') seen.set(rest, false);
+  }
+  return [...seen].map(([name, dir]) => ({ name, dir })).sort((a, b) => b.dir - a.dir || a.name.localeCompare(b.name));
+}
+
+function notify(text) {
+  const d = document.createElement('div'); d.className = 'toast'; d.textContent = text;
+  document.getElementById('toasts').appendChild(d);
+  setTimeout(() => d.remove(), 3500);
+}
 
 function applySettings() {
   const r = document.documentElement;
@@ -119,6 +151,8 @@ function openWindow(title, icon, render, opts = {}) {
 // ---------- Apps integradas ----------
 const builtins = [
   { id: 'terminal', name: 'Terminal', icon: '⌨️', open: openTerminal },
+  { id: 'files',    name: 'Archivos', icon: '📁', open: () => openFiles() },
+  { id: 'qubit',    name: 'Qubit Lab', icon: '⚛️', open: openQubitLab },
   { id: 'notes',    name: 'Notas',    icon: '📝', open: openNotes },
   { id: 'builder',  name: 'Agregar App', icon: '➕', open: openBuilder },
   { id: 'manager',  name: 'Mis Apps', icon: '🗂️', open: openManager },
@@ -134,14 +168,144 @@ function openNotes() {
   });
 }
 
+// SDK inyectado en las apps HTML: window.os.{notify, fs.read/write/list/remove}
+const SDK = '<script>(()=>{let id=0;const p={};addEventListener("message",e=>{const m=e.data;if(m&&m.dqos&&p[m.id]){m.err?p[m.id].rej(new Error(m.err)):p[m.id].res(m.val);delete p[m.id]}});' +
+  'const call=(m,a)=>new Promise((res,rej)=>{const i=++id;p[i]={res,rej};parent.postMessage({dqos:1,id:i,m,a},"*")});' +
+  'window.os={notify:t=>call("notify",[t]),fs:{read:f=>call("read",[f]),write:(f,c)=>call("write",[f,c]),list:()=>call("list",[]),remove:f=>call("remove",[f])}};})()<\/script>';
+const frames = new WeakMap();   // contentWindow -> app
+
+addEventListener('message', e => {
+  const m = e.data, app = m && m.dqos && frames.get(e.source);
+  if (!app) return;
+  const root = '/apps/' + app.id + '/';
+  const path = f => root + String(f).replace(/^\/+/, '').replace(/\.\.+/g, '');
+  const ops = {
+    notify: t => { notify(app.name + ': ' + t); },
+    read: f => fs[path(f)] ?? null,
+    write: (f, c) => { fs[path(f)] = String(c); saveFs(); },
+    list: () => Object.keys(fs).filter(k => k.startsWith(root)).map(k => k.slice(root.length)),
+    remove: f => { delete fs[path(f)]; saveFs(); },
+  };
+  let reply;
+  try { reply = { dqos: 1, id: m.id, val: ops[m.m] ? ops[m.m](...m.a) : undefined }; }
+  catch (err) { reply = { dqos: 1, id: m.id, err: String(err) }; }
+  e.source.postMessage(reply, '*');
+});
+
 function openCustom(app) {
   openWindow(app.name, app.icon, b => {
     b.style.padding = '0';
     const f = document.createElement('iframe');
     f.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
-    if (app.type === 'url') f.src = app.content; else f.srcdoc = app.content;
+    if (app.type === 'url') f.src = app.content; else f.srcdoc = SDK + app.content;
     b.appendChild(f);
+    frames.set(f.contentWindow, app);
   }, { w: 640, h: 440 });
+}
+
+const TEMPLATES = {
+  'Vacía': '',
+  'Calculadora': ['<input id="e" placeholder="2+2*3" style="width:70%;font-size:20px">',
+    '<button onclick="r.textContent=eval(e.value.replace(/[^-+*/().0-9 ]/g,\'\'))">=</button><h2 id="r"></h2>'].join('\n'),
+  'Tareas (guarda en archivos)': ['<h3>Tareas</h3><input id="t"><button onclick="add()">+</button><ul id="l"></ul>',
+    '<script>let T=[];const draw=()=>l.innerHTML=T.map((x,i)=>"<li onclick=\'T.splice("+i+",1);save()\'>"+x.replace(/</g,"&lt;")+"</li>").join("");',
+    'const save=async()=>{await os.fs.write("tareas.json",JSON.stringify(T));draw()};',
+    'const add=()=>{if(t.value){T.push(t.value);t.value="";save();os.notify("Tarea agregada")}};',
+    'os.fs.read("tareas.json").then(v=>{T=v?JSON.parse(v):[];draw()});<\/script>'].join('\n'),
+  'Reloj': '<h1 id="c" style="font-size:48px;text-align:center"></h1><script>setInterval(()=>c.textContent=new Date().toLocaleTimeString(),500)<\/script>',
+};
+
+function openFiles(startDir) {
+  let dir = startDir || '/';
+  openWindow('Archivos', '📁', b => {
+    const draw = () => {
+      b.innerHTML = '';
+      const top = document.createElement('div');
+      top.style.cssText = 'display:flex;gap:6px;align-items:center;margin-bottom:8px';
+      top.innerHTML = '<button class="btn" data-up>⬆️</button><b style="flex:1"></b><button class="btn" data-nf>+ Archivo</button><button class="btn" data-nd>+ Carpeta</button>';
+      top.querySelector('b').textContent = dir;
+      top.querySelector('[data-up]').onclick = () => { dir = dir.replace(/[^/]+\/$/, '') || '/'; draw(); };
+      top.querySelector('[data-nf]').onclick = () => { const n = prompt('Nombre del archivo'); if (n) { fs[dir + n] = ''; saveFs(); openEditor(dir + n); draw(); } };
+      top.querySelector('[data-nd]').onclick = () => { const n = prompt('Nombre de la carpeta'); if (n) { fs[dir + n + '/.keep'] = ''; saveFs(); draw(); } };
+      b.appendChild(top);
+      const es = fsEntries(dir);
+      if (!es.length) b.insertAdjacentHTML('beforeend', '<p>Carpeta vacía</p>');
+      es.forEach(en => {
+        const row = document.createElement('div'); row.className = 'row';
+        row.innerHTML = '<span style="flex:1"></span><button class="btn">🗑️</button>';
+        row.firstChild.textContent = (en.dir ? '📁 ' : '📄 ') + en.name;
+        row.onclick = () => en.dir ? (dir += en.name + '/', draw()) : openEditor(dir + en.name);
+        row.querySelector('button').onclick = ev => {
+          ev.stopPropagation();
+          if (!confirm('¿Borrar ' + en.name + '?')) return;
+          const p = dir + en.name;
+          Object.keys(fs).filter(k => k === p || k.startsWith(p + '/')).forEach(k => delete fs[k]);
+          saveFs(); draw();
+        };
+        b.appendChild(row);
+      });
+    };
+    draw();
+  }, { w: 480, h: 380 });
+}
+
+function openEditor(path) {
+  openWindow(path.split('/').pop(), '📄', b => {
+    b.innerHTML = '<textarea style="height:calc(100% - 48px)"></textarea><p style="margin:8px 0 0"><button class="btn primary">Guardar</button></p>';
+    const t = b.querySelector('textarea'); t.value = fs[path] || '';
+    b.querySelector('button').onclick = () => { fs[path] = t.value; saveFs(); notify('Guardado ' + path); };
+  }, { w: 480, h: 360 });
+}
+
+// Simulador de 2 qubits (vector de estado, amplitudes complejas). Índice = q1*2 + q0.
+function openQubitLab() {
+  openWindow('Qubit Lab', '⚛️', b => {
+    const R = Math.SQRT1_2;
+    const G = {
+      H: [[[R, 0], [R, 0]], [[R, 0], [-R, 0]]],
+      X: [[[0, 0], [1, 0]], [[1, 0], [0, 0]]],
+      Y: [[[0, 0], [0, -1]], [[0, 1], [0, 0]]],
+      Z: [[[1, 0], [0, 0]], [[0, 0], [-1, 0]]],
+      S: [[[1, 0], [0, 0]], [[0, 0], [0, 1]]],
+      T: [[[1, 0], [0, 0]], [[0, 0], [R, R]]],
+    };
+    let st, log, shots;
+    const reset = () => { st = [[1, 0], [0, 0], [0, 0], [0, 0]]; log = []; shots = null; };
+    const mul = (a, c) => [a[0] * c[0] - a[1] * c[1], a[0] * c[1] + a[1] * c[0]];
+    const add = (a, c) => [a[0] + c[0], a[1] + c[1]];
+    const probs = () => st.map(a => a[0] * a[0] + a[1] * a[1]);
+    const label = i => '|' + i.toString(2).padStart(2, '0') + '⟩';
+    const apply = (g, k) => {
+      const n = st.map(x => x.slice());
+      for (let i = 0; i < 4; i++) if (!((i >> k) & 1)) {
+        const j = i | (1 << k), a = st[i], c = st[j];
+        n[i] = add(mul(G[g][0][0], a), mul(G[g][0][1], c));
+        n[j] = add(mul(G[g][1][0], a), mul(G[g][1][1], c));
+      }
+      st = n; log.push(g + '(q' + k + ')');
+    };
+    const sample = () => { const p = probs(); let r = Math.random(), i = 0; while (i < 3 && r >= p[i]) r -= p[i++]; return i; };
+    const cx = ctl => { const [a, c] = ctl === 0 ? [1, 3] : [2, 3]; [st[a], st[c]] = [st[c], st[a]]; log.push('CNOT(q' + ctl + '→q' + (1 - ctl) + ')'); };
+    const fmt = a => a[0].toFixed(3) + (a[1] < 0 ? '' : '+') + a[1].toFixed(3) + 'i';
+
+    const draw = () => {
+      const p = probs();
+      const gateRow = k => '<div class="gates"><b>q' + k + '</b>' + Object.keys(G).map(g => '<button class="btn" data-g="' + g + '" data-k="' + k + '">' + g + '</button>').join('') + '</div>';
+      b.innerHTML = gateRow(0) + gateRow(1) +
+        '<div class="gates"><button class="btn" data-cx="0">CNOT q0→q1</button><button class="btn" data-cx="1">CNOT q1→q0</button>' +
+        '<button class="btn primary" data-m>Medir</button><button class="btn" data-s>×1000</button><button class="btn" data-r>Reset</button></div>' +
+        p.map((v, i) => '<div style="display:flex;gap:8px;align-items:center;margin:3px 0"><code style="width:48px">' + label(i) + '</code><div style="flex:1"><div class="bar2" style="width:' + (v * 100) + '%"></div></div><span style="width:60px;text-align:right">' + (v * 100).toFixed(1) + '%</span></div>').join('') +
+        '<pre style="opacity:.8;font-size:12px">' + st.map((a, i) => label(i) + ' ' + fmt(a)).join('\n') + '</pre>' +
+        (shots ? '<div>Mediciones: ' + shots.map((c, i) => label(i) + '=' + c).join('  ') + '</div>' : '') +
+        '<div style="opacity:.7;margin-top:6px">Circuito: ' + (log.join(' → ') || '—') + '</div>';
+      b.querySelectorAll('[data-g]').forEach(x => x.onclick = () => { apply(x.dataset.g, +x.dataset.k); shots = null; draw(); });
+      b.querySelectorAll('[data-cx]').forEach(x => x.onclick = () => { cx(+x.dataset.cx); shots = null; draw(); });
+      b.querySelector('[data-m]').onclick = () => { const i = sample(); st = st.map((_, j) => [j === i ? 1 : 0, 0]); log.push('Medir→' + label(i)); notify('Resultado: ' + label(i)); draw(); };
+      b.querySelector('[data-s]').onclick = () => { shots = [0, 0, 0, 0]; for (let n = 0; n < 1000; n++) shots[sample()]++; draw(); };
+      b.querySelector('[data-r]').onclick = () => { reset(); draw(); };
+    };
+    reset(); draw();
+  }, { w: 520, h: 480 });
 }
 
 function openBuilder(editId) {
@@ -151,9 +315,11 @@ function openBuilder(editId) {
       <label>Nombre</label><input id="n" placeholder="Mi app">
       <label>Ícono (emoji)</label><input id="i" value="🧩" maxlength="4">
       <label>Tipo</label><select id="t"><option value="html">Código HTML/JS (lo escribes aquí)</option><option value="url">URL externa</option></select>
+      <label>Plantilla</label><select id="tp">${Object.keys(TEMPLATES).map(k => `<option>${k}</option>`).join('')}</select>
       <label>Contenido (código o URL)</label><textarea id="c" rows="10" placeholder="<h1>Hola</h1>&lt;script&gt;…&lt;/script&gt;"></textarea>
       <p><button class="btn primary" id="ok">${editing ? 'Guardar' : 'Instalar'}</button></p>`;
     if (editing) { n.value = editing.name; i.value = editing.icon; t.value = editing.type; c.value = editing.content; }
+    tp.onchange = () => { c.value = TEMPLATES[tp.value]; t.value = 'html'; };
     ok.onclick = () => {
       if (!n.value.trim() || !c.value.trim()) return alert('Falta nombre o contenido');
       const data = { name: n.value.trim(), icon: i.value || '🧩', type: t.value, content: c.value };
@@ -185,15 +351,17 @@ function openSettings() {
   openWindow('Ajustes', '⚙️', b => {
     b.innerHTML = `
       <label>Tema</label><select id="th"><option value="dark">Oscuro</option><option value="light">Claro</option></select>
+      <label><input id="qb" type="checkbox" style="width:auto"> Fondo cuántico animado</label>
       <label>Fondo (color 1)</label><input id="c1" type="color">
       <label>Fondo (color 2)</label><input id="c2" type="color">
       <p><button class="btn" id="exp">Exportar todo (JSON)</button> <button class="btn" id="imp">Importar</button> <button class="btn" id="rst">Restablecer</button></p>`;
-    th.value = settings.theme; c1.value = settings.bg1; c2.value = settings.bg2;
+    th.value = settings.theme; c1.value = settings.bg1; c2.value = settings.bg2; qb.checked = settings.qbg !== false;
+    qb.onchange = () => { settings.qbg = qb.checked; saveSettings(); startBg(); };
     th.onchange = () => { settings.theme = th.value; saveSettings(); };
     c1.oninput = () => { settings.bg1 = c1.value; saveSettings(); };
     c2.oninput = () => { settings.bg2 = c2.value; saveSettings(); };
     exp.onclick = () => {
-      const blob = new Blob([JSON.stringify({ apps: customApps, settings, notes }, null, 2)], { type: 'application/json' });
+      const blob = new Blob([JSON.stringify({ apps: customApps, settings, notes, fs }, null, 2)], { type: 'application/json' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'digico-os-backup.json'; a.click();
     };
     imp.onclick = () => {
@@ -201,8 +369,8 @@ function openSettings() {
       inp.onchange = async () => {
         try {
           const d = JSON.parse(await inp.files[0].text());
-          customApps = d.apps || []; settings = d.settings || settings; notes = d.notes || '';
-          saveApps(); saveSettings(); LS.set('notes', notes); refresh();
+          customApps = d.apps || []; settings = Object.assign(settings, d.settings || {}); notes = d.notes || ''; fs = d.fs || fs;
+          saveApps(); saveSettings(); saveFs(); LS.set('notes', notes); refresh(); startBg();
         } catch { alert('Archivo inválido'); }
       };
       inp.click();
@@ -220,7 +388,12 @@ function openTerminal() {
     const all = () => [...builtins, ...customApps];
     const find = n => all().find(a => a.id === n || a.name.toLowerCase() === n.toLowerCase());
     const cmds = {
-      help: () => print('help | apps | open <app> | install <nombre> <url> | remove <app> | theme dark|light | date | clear | echo <txt>'),
+      help: () => print('help | apps | open <app> | install <nombre> <url> | remove <app> | theme dark|light\nls [dir] | cat <f> | write <f> <txt> | rm <f> | notify <txt> | date | clear | echo <txt>'),
+      ls: a => { let d = absPath(a[0] || '/'); if (!d.endsWith('/')) d += '/'; const es = fsEntries(d); print(es.length ? es.map(e => (e.dir ? '📁 ' : '📄 ') + e.name).join('\n') : '(vacío)'); },
+      cat: a => print(fs[absPath(a[0] || '')] ?? 'No existe'),
+      write: a => { fs[absPath(a[0] || '')] = a.slice(1).join(' '); saveFs(); },
+      rm: a => { const p = absPath(a[0] || ''); print(p in fs ? (delete fs[p], saveFs(), 'Borrado') : 'No existe'); },
+      notify: a => notify(a.join(' ')),
       apps: () => print(all().map(a => a.icon + ' ' + a.name).join('\n')),
       open: a => { const x = find(a.join(' ')); x ? (x.open ? x.open() : openCustom(x)) : print('No existe: ' + a.join(' ')); },
       install: a => { if (a.length < 2) return print('uso: install <nombre> <url>'); customApps.push({ id: 'app' + Date.now(), name: a[0], icon: '🌐', type: 'url', content: a[1] }); saveApps(); refresh(); print('Instalada ' + a[0]); },
@@ -259,7 +432,33 @@ document.getElementById('startBtn').onclick = e => { e.stopPropagation(); const 
 document.addEventListener('click', e => { if (!e.target.closest('#menu')) document.getElementById('menu').style.display = 'none'; });
 setInterval(() => document.getElementById('clock').textContent = new Date().toLocaleTimeString(), 1000);
 
-applySettings(); refresh();
+// ---------- Fondo cuántico: red de partículas ----------
+const bg = document.getElementById('qbg'), bgx = bg.getContext('2d');
+const pts = Array.from({ length: 60 }, () => ({ x: Math.random(), y: Math.random(), vx: (Math.random() - .5) * 3e-4, vy: (Math.random() - .5) * 3e-4 }));
+let bgRaf = 0;
+function fitBg() { bg.width = bg.clientWidth; bg.height = bg.clientHeight; }
+function startBg() {
+  cancelAnimationFrame(bgRaf);
+  if (settings.qbg === false) { bg.style.display = 'none'; return; }
+  bg.style.display = 'block'; fitBg();
+  const tick = () => {
+    const W = bg.width, H = bg.height;
+    bgx.clearRect(0, 0, W, H);
+    pts.forEach(p => { p.x = (p.x + p.vx + 1) % 1; p.y = (p.y + p.vy + 1) % 1; });
+    pts.forEach((p, i) => {
+      bgx.fillStyle = 'rgba(160,140,255,.8)'; bgx.beginPath(); bgx.arc(p.x * W, p.y * H, 2, 0, 7); bgx.fill();
+      for (let j = i + 1; j < pts.length; j++) {
+        const d = Math.hypot((p.x - pts[j].x) * W, (p.y - pts[j].y) * H);
+        if (d < 120) { bgx.strokeStyle = 'rgba(124,92,255,' + (1 - d / 120) * .5 + ')'; bgx.beginPath(); bgx.moveTo(p.x * W, p.y * H); bgx.lineTo(pts[j].x * W, pts[j].y * H); bgx.stroke(); }
+      }
+    });
+    bgRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+addEventListener('resize', fitBg);
+
+applySettings(); refresh(); startBg();
 </script>
 </body>
 </html>
