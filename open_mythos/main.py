@@ -720,9 +720,11 @@ class LTIInjection(nn.Module):
             guaranteeing ρ(A) < 1 regardless of learned parameter values.
         """
         # Compute in log space to avoid 0 * inf = NaN when log_dt → -∞, log_A → +∞.
+        # lower clamp -10 (not -20): exp(-exp(-20)) rounds to exactly 1.0 in float32,
+        # which would break the A < 1 stability guarantee
         # dt * A_c = -exp(log_dt) * exp(log_A) = -exp(log_dt + log_A)
         # Clamp keeps the product finite in float32 for any gradient step size.
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
+        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-10, 20)))
 
     def forward(
         self, h: torch.Tensor, e: torch.Tensor, transformer_out: torch.Tensor
